@@ -5,6 +5,7 @@
 1. Run the following
 ```
 conda env create -f env.yml
+conda activate langchain
 conda develop .
 ```
 
