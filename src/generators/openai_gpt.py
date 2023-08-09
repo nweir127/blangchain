@@ -2,77 +2,21 @@ import ast
 import copy
 import json
 import logging
-import random
-import time
-from typing import List, Optional, Tuple
+from typing import List, Tuple, Dict
 
 import langchain
-import openai
 from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, AIMessagePromptTemplate
 from langchain.prompts.chat import BaseMessagePromptTemplate
-from langchain.schema import BaseLanguageModel, LLMResult
+from langchain.schema import LLMResult
+from langchain.schema.language_model import BaseLanguageModel
 
 from src.generators import LMGenerator
+from src.generators.async_openai import JitterWaitChatOpenAI
 from src.utils.tracking_utils import TokensTracker
 
 logger = logging.getLogger(__name__)
 from langchain import OpenAI, LLMChain, PromptTemplate, FewShotPromptTemplate
-from langchain.schema import (
-    AIMessage,
-    BaseMessage, ChatResult, Generation, ChatGeneration
-)
-from langchain.chat_models import ChatOpenAI
 import asyncio
-
-
-class CachedChatOpenAI(ChatOpenAI):
-    def _generate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None) -> ChatResult:
-        messages_prompt = repr(messages)
-        if langchain.llm_cache:
-            results = langchain.llm_cache.lookup(messages_prompt, self.model_name)
-            if results:
-                chat_result = ChatResult(
-                    generations=[ChatGeneration(message=AIMessage(content=result.text)) for result in results],
-                    llm_output=results[0].generation_info)
-                return chat_result
-        chat_result = super()._generate(messages, stop)
-        if langchain.llm_cache:
-            results = [Generation(
-                text=gen.message.content,
-                generation_info=chat_result.llm_output
-            ) for gen in chat_result.generations]
-            langchain.llm_cache.update(messages_prompt, self.model_name, results)
-        return chat_result
-
-    async def _agenerate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None) -> ChatResult:
-        messages_prompt = repr(messages)
-        if langchain.llm_cache:
-            results = langchain.llm_cache.lookup(messages_prompt, self.model_name)
-            if results:
-                chat_result = ChatResult(
-                    generations=[ChatGeneration(message=AIMessage(content=result.text)) for result in results],
-                    llm_output=results[0].generation_info)
-                return chat_result
-        max_retries = 5
-        n_retries = 0
-        while True:
-            n_retries = n_retries + 1
-            try:
-                chat_result = await super()._agenerate(messages, stop)
-                break
-            except openai.error.OpenAIError as e: #  RateLimitError
-                time.sleep(30)
-                if n_retries == max_retries:
-                    raise e
-
-
-        if langchain.llm_cache:
-            results = [Generation(
-                text=gen.message.content,
-                generation_info=chat_result.llm_output
-            ) for gen in chat_result.generations]
-            langchain.llm_cache.update(messages_prompt, self.model_name, results)
-        return chat_result
 
 
 class OpenAIGenerator(LMGenerator):
@@ -89,8 +33,9 @@ class OpenAIGenerator(LMGenerator):
                 "n": 1,
                 'temperature': 0.7,
                 'model_name': 'text-davinci-003',
-                "top_p": 1,
-                "max_tokens": 1000
+                # "top_p": 1,
+                "max_tokens": 1000,
+                "max_retries": 100,
             }
             self.lm_class = OpenAI
 
@@ -99,18 +44,19 @@ class OpenAIGenerator(LMGenerator):
                 "n": 1,
                 'model_name': "gpt-3.5-turbo-0613" if model == 'chatgpt' else 'gpt-4',
                 'temperature': 1,
-                "top_p": 1,
+                # "top_p": 1,
                 "request_timeout": 600,
-                "max_retries": 0,
+                "max_retries": 100,
             }
-            self.lm_class = CachedChatOpenAI
+            # self.lm_class = CachedChatOpenAI
+            self.lm_class = JitterWaitChatOpenAI
         else:
             raise NotImplementedError()
         self.batch_size = 50
         self.prompt = prompt
         self.total_tokens = 0
 
-    def generate(self, inputs: List[dict], parallel=True, **gen_kwargs) -> List[List[str]]:
+    def generate(self, inputs: List[dict], parallel=False, **gen_kwargs) -> List[List[str]]:
         _gkwargs = copy.deepcopy(self.gen_kwargs)
         _gkwargs.update(**gen_kwargs)
         if self.model_type == 'gpt3' and _gkwargs.get('n', 1) > 1:
@@ -138,7 +84,7 @@ class OpenAIGenerator(LMGenerator):
             ret.extend([[g.text for g in gen] for gen in lm_output.generations])
         return ret
 
-    async def agenerate(self, inputs: List[dict], **gen_kwargs)-> List[List[str]]:
+    async def agenerate(self, inputs: List[dict], **gen_kwargs) -> List[List[str]]:
         _gkwargs = copy.deepcopy(self.gen_kwargs)
         _gkwargs.update(**gen_kwargs)
         if self.model_type == 'gpt3' and _gkwargs.get('n', 1) > 1:
@@ -157,8 +103,8 @@ class OpenAIGenerator(LMGenerator):
         ret = [[g.text for g in gen] for gen in lm_output.generations]
         return ret
 
-    def print_ex(self, ex):
-        print(self.prompt.format(**ex))
+    def format_print(self, input: Dict):
+        print(self.prompt.format(**input))
 
 
 class SimplePromptOpenAIGenerator(OpenAIGenerator):
@@ -174,16 +120,9 @@ class SimplePromptOpenAIGenerator(OpenAIGenerator):
         super().__init__(prompt=prompt, model=model)
 
 
-
-
-message_type_to_prompt_class = {
-    'human' : HumanMessagePromptTemplate,
-    'ai':  AIMessagePromptTemplate
-}
-
-
 class JSONItemGenerator:
-    def postprocess_generation(self, gen: str, expected_items: int =None) -> List[dict]:
+
+    async def postprocess_generation(self, gen: str, expected_items: int = None) -> List[dict]:
         """
         Takes a (potentially multi-line) string and turns it into a list of dicts
         """
@@ -199,8 +138,12 @@ class JSONItemGenerator:
                 try:
                     results.append(json.loads(line))
                 except:
-                    continue
-
+                    try:
+                        fixer = JSONFixer()
+                        fixed_json: dict = (await fixer.afix(line))
+                        results.append(fixed_json)
+                    except:
+                        continue
 
         if expected_items and len(results) != expected_items:
             if len(results) > expected_items:
@@ -211,9 +154,79 @@ class JSONItemGenerator:
                     res[r['I'] - 1] = r
                 if any(res):
                     results = res
-                else: # final resort
+                else:  # final resort
                     results = results + [{} for _ in range(expected_items - len(results))]
         return results
+
+
+class JSONOpenAIGenerator(SimplePromptOpenAIGenerator, JSONItemGenerator):
+    def __init__(self, *args, **kwargs):
+        super(JSONOpenAIGenerator, self).__init__(*args, **kwargs)
+
+    def batchify(self, items_to_batch, max_size=None):
+        if len(items_to_batch) <= 25:
+            _statement_batch_size = len(items_to_batch)
+        elif len(items_to_batch) > 25 and len(items_to_batch) <= 50:
+            _statement_batch_size = int(len(items_to_batch) / 2) + 1
+        elif len(items_to_batch) > 50:
+            # _statement_batch_size = min(30, int(len(statements_to_score) / 4) + 1)
+            _statement_batch_size = 25
+        else:
+            raise NotImplementedError()
+        if max_size is not None:
+            if len(items_to_batch) % max_size == 1:
+                _statement_batch_size = max_size - 1
+            else:
+                _statement_batch_size = max_size
+
+        statement_batches = [items_to_batch[i:i + _statement_batch_size]
+                             for i in range(0, len(items_to_batch), _statement_batch_size)]
+
+        return statement_batches
+
+    async def run(self, inputs: List[dict], **kwargs) -> List[List[List[dict]]]:
+        generations: List[List[str]] = await self.agenerate(inputs, **kwargs)
+        result = [list(await asyncio.gather(*[self.postprocess_generation(gg) for gg in g]))
+                  for g in generations]
+        return result
+
+
+class JSONFixer(JSONOpenAIGenerator):
+    def __init__(self):
+        PROMPT = """You are a system for fixing syntax errors in json items. This includes missing quotes around strings and missing closing brackets. If a key is missing its value, map it to None. Do not add new key/value pairs that are not already there.
+
+Given the following malformed json item, return a serialized, one-line version that can be complied by json.loads() in python.
+Your output should be this json item on a single line and nothing else. 
+
+{input}
+"""
+        super(JSONFixer, self).__init__(prompt_template=PromptTemplate.from_template(PROMPT))
+
+    async def afix(self, input_str) -> dict:
+        '''
+        takes a malformed json line and tries to fix it with gpt
+        :param input_str:
+        :return: json loaded item
+        '''
+        inputs = [dict(input=input_str)]
+        ret: str = (await self.agenerate(inputs))[0][0]
+        ret = ret.strip("\n").split("\n")[0]
+        try:
+            ret = json.loads(ret)
+        except:
+            ret = ast.literal_eval(ret.replace('null', "None"))
+
+        if isinstance(ret, str):
+            assert False
+
+        return ret
+
+
+message_type_to_prompt_class = {
+    'human': HumanMessagePromptTemplate,
+    'ai': AIMessagePromptTemplate
+}
+
 
 class FollowupPromptOpenAIGenerator(OpenAIGenerator):
     def __init__(self, prompt_template_list: List[Tuple[str, PromptTemplate]], model='gpt3'):
@@ -229,8 +242,9 @@ class FollowupPromptOpenAIGenerator(OpenAIGenerator):
                     example_selector=first_prompt.example_selector,
                     example_prompt=first_prompt.example_prompt,
                     suffix=first_prompt.suffix + '\n' + combined_template,
-                    input_variables = first_prompt.input_variables + PromptTemplate.from_template(combined_template).input_variables,
-                    example_separator = first_prompt.example_separator,
+                    input_variables=first_prompt.input_variables + PromptTemplate.from_template(
+                        combined_template).input_variables,
+                    example_separator=first_prompt.example_separator,
                     prefix=first_prompt.prefix
                 )
             else:
