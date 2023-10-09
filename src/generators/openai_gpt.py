@@ -2,7 +2,7 @@ import ast
 import copy
 import json
 import logging
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Callable
 
 import langchain
 from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, AIMessagePromptTemplate
@@ -11,12 +11,25 @@ from langchain.schema import LLMResult
 from langchain.schema.language_model import BaseLanguageModel
 
 from src.generators import LMGenerator
-from src.generators.async_openai import JitterWaitChatOpenAI
+from src.generators.async_openai import JitterWaitChatOpenAI, JitterWaitOpenAI
 from src.utils.tracking_utils import TokensTracker
 
 logger = logging.getLogger(__name__)
-from langchain import OpenAI, LLMChain, PromptTemplate, FewShotPromptTemplate
+from langchain import LLMChain, PromptTemplate, FewShotPromptTemplate
 import asyncio
+
+completion_model_map = {
+    'gpt3': 'text-davinci-003',
+    'gpt-3.5-turbo-instruct': 'gpt-3.5-turbo-instruct',
+    'turbo-instruct': 'gpt-3.5-turbo-instruct',
+}
+
+chat_model_map = {
+    'chatgpt': "gpt-3.5-turbo-0613",
+    'gpt-3.5-turbo-16k': "gpt-3.5-turbo-16k",
+    'chatgpt-16k': "gpt-3.5-turbo-16k",
+    'gpt-4': 'gpt-4',
+}
 
 
 class OpenAIGenerator(LMGenerator):
@@ -26,23 +39,24 @@ class OpenAIGenerator(LMGenerator):
         :param prompt:
         :param model: either "gpt3" or "Chatgpt"
         """
+        self.tracker = TokensTracker
         self.model_type = model
         self.lm_class: BaseLanguageModel = None
-        if model == 'gpt3':
+        if model in completion_model_map:
             self.gen_kwargs = {
                 "n": 1,
-                'temperature': 0.7,
-                'model_name': 'text-davinci-003',
+                'temperature': 1,
+                'model_name': completion_model_map.get(model),
                 # "top_p": 1,
                 "max_tokens": 1000,
                 "max_retries": 100,
             }
-            self.lm_class = OpenAI
+            self.lm_class = JitterWaitOpenAI
 
-        elif model in ['chatgpt', 'gpt4']:
+        elif model in chat_model_map:
             self.gen_kwargs = {
                 "n": 1,
-                'model_name': "gpt-3.5-turbo-0613" if model == 'chatgpt' else 'gpt-4',
+                'model_name': chat_model_map.get(model),
                 'temperature': 1,
                 # "top_p": 1,
                 "request_timeout": 600,
@@ -61,6 +75,7 @@ class OpenAIGenerator(LMGenerator):
         _gkwargs.update(**gen_kwargs)
         if self.model_type == 'gpt3' and _gkwargs.get('n', 1) > 1:
             _gkwargs['best_of'] = _gkwargs['n']
+
         assert langchain.llm_cache is not None
         lm = self.lm_class(**_gkwargs)
         chain = LLMChain(llm=lm, prompt=self.prompt)
@@ -75,7 +90,6 @@ class OpenAIGenerator(LMGenerator):
                         logger.info(lm_out_i.llm_output)
                         TokensTracker.update(lm_out_i.llm_output, module=type(self).__name__)
                     return LLMResult(generations=[lm_out_i.generations[0] for lm_out_i in ret_list], )
-
                 lm_output = asyncio.run(gen())
             else:
                 lm_output = chain.generate(in_batch)
@@ -89,29 +103,37 @@ class OpenAIGenerator(LMGenerator):
         _gkwargs.update(**gen_kwargs)
         if self.model_type == 'gpt3' and _gkwargs.get('n', 1) > 1:
             _gkwargs['best_of'] = _gkwargs['n']
+
         assert langchain.llm_cache is not None
         lm = self.lm_class(**_gkwargs)
         chain = LLMChain(llm=lm, prompt=self.prompt)
         tasks = [chain.agenerate([ib]) for ib in inputs]
         ret_list = await asyncio.gather(*tasks)
         for lm_out_i in ret_list:
-            logger.info(lm_out_i.llm_output)
+            logger.info(f"{type(self).__name__}: {lm_out_i.llm_output}")
             TokensTracker.update(lm_out_i.llm_output, module=type(self).__name__)
             self.total_tokens += lm_out_i.llm_output.get('token_usage', {}).get('total_tokens', 0)
         lm_output = LLMResult(generations=[lm_out_i.generations[0] for lm_out_i in ret_list])
 
         ret = [[g.text for g in gen] for gen in lm_output.generations]
+        # if self.model_type in ['gpt-3.5-turbo-0613', 'chatgpt']:
+        #     breakpoint()
         return ret
 
-    def format_print(self, input: Dict):
-        print(self.prompt.format(**input))
+    def format_print(self, input: Dict, _print: Callable = print):
+        _print(self.prompt.format(**input))
+
+    def format_print_to(self, input: Dict, file=None):
+        with open(file, 'a+') as f:
+            self.format_print(input, _print=lambda x: f.write(str(x) + '\n'))
 
 
 class SimplePromptOpenAIGenerator(OpenAIGenerator):
-    def __init__(self, prompt_template: PromptTemplate, model='chatgpt'):
-        if model == 'gpt3':
+    def __init__(self, prompt_template: PromptTemplate, model='chatgpt', debug_openai=False):
+        self.debug_openai = debug_openai
+        if model in completion_model_map:
             prompt = prompt_template
-        elif model in ['chatgpt', 'gpt4']:
+        elif model in chat_model_map:
             prompt = ChatPromptTemplate.from_messages([
                 HumanMessagePromptTemplate(prompt=prompt_template)
             ])
@@ -231,7 +253,7 @@ message_type_to_prompt_class = {
 class FollowupPromptOpenAIGenerator(OpenAIGenerator):
     def __init__(self, prompt_template_list: List[Tuple[str, PromptTemplate]], model='gpt3'):
 
-        if model == 'gpt3':
+        if model in completion_model_map:
             if any(isinstance(i, FewShotPromptTemplate) for i in prompt_template_list[1:]):
                 raise NotImplementedError("cannot handle template lists that have fewshot prompts after the first")
             if isinstance(prompt_template_list[0][1], FewShotPromptTemplate):
@@ -256,7 +278,7 @@ class FollowupPromptOpenAIGenerator(OpenAIGenerator):
 
                 combined_template = '\n\n'.join(template.template for (_, template) in prompt_template_list)
                 prompt = PromptTemplate.from_template(combined_template)
-        elif model in ['chatgpt', 'gpt4']:
+        elif model in chat_model_map:
             prompt = ChatPromptTemplate.from_messages([
                 message_type_to_prompt_class[_type](prompt=template) for (_type, template) in prompt_template_list
             ])
