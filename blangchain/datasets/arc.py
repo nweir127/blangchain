@@ -1,7 +1,7 @@
 from typing import Union, List
 
-from src.datasets import Question, QuestionDataset
-from src.nellie.dataset import ARC
+from blangchain.datasets import Question, QuestionDataset
+from blangchain.nellie.dataset import ARC
 
 
 class ARCQuestion(Question):

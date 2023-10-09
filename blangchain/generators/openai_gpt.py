@@ -10,9 +10,9 @@ from langchain.prompts.chat import BaseMessagePromptTemplate
 from langchain.schema import LLMResult
 from langchain.schema.language_model import BaseLanguageModel
 
-from src.generators import LMGenerator
-from src.generators.async_openai import JitterWaitChatOpenAI, JitterWaitOpenAI
-from src.utils.tracking_utils import TokensTracker
+from blangchain.generators import LMGenerator
+from blangchain.generators.async_openai import JitterWaitChatOpenAI, JitterWaitOpenAI
+from blangchain.utils.tracking_utils import TokensTracker
 
 logger = logging.getLogger(__name__)
 from langchain import LLMChain, PromptTemplate, FewShotPromptTemplate

@@ -11,8 +11,8 @@ import pandas as pd
 from langchain import PromptTemplate
 from tqdm import tqdm
 from transformers import HfArgumentParser
-from src.generators.openai_gpt import SimplePromptOpenAIGenerator, JSONItemGenerator
-from src.utils import flatten
+from blangchain.generators.openai_gpt import SimplePromptOpenAIGenerator, JSONItemGenerator
+from blangchain.utils import flatten
 
 PROMPT = """For each of the following questions, we have asked a reasoning system to give an answer and justify its decision in the form of "BECAUSE ____ AND ____ IT FOLLOWS THAT _____.
 

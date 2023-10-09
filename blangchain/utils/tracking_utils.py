@@ -1,6 +1,5 @@
 from collections import defaultdict
 import pandas as pd
-import wandb
 
 init_count = (lambda: dict(
     prompt_tokens=0,
