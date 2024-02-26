@@ -9,7 +9,7 @@ import langchain
 from langchain.cache import SQLiteCache
 from langchain.chat_models import ChatOpenAI
 
-langchain.llm_cache = SQLiteCache(database_path=os.path.join(__PATH__, ".langchain.db"))
+langchain.llm_cache = SQLiteCache(database_path=os.path.join(__PATH__, "cache/.langchain.db"))
 import re
 from src.utils.tracking_utils import TokensTracker, ErrorsTracker
 from langchain.output_parsers import OutputFixingParser, RegexDictParser

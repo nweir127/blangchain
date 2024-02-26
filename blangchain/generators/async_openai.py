@@ -41,7 +41,7 @@ def _create_retry_decorator(llm: Union[ChatOpenAI, OpenAI]) -> Callable[[Any], A
     import openai
 
     min_seconds = 4
-    max_seconds = 45
+    max_seconds = 60
     # Wait 2^x * 1 second between each retry starting with
     # 4 seconds, then up to 10 seconds, then 10 seconds afterwards
     return retry(
